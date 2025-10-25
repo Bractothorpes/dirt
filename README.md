@@ -9,7 +9,7 @@
 **Step 2:** Extract the contents of the zip file.  
 **Step 3:** Run `dirtinstaller.exe` **with admin permissions** to add Dirt to your system PATH.  
 **Step 4:** *(Optional)* Delete the original Dirt folder from your Downloads folder.  
-**Step 5:** Enjoy! You can now use Dirt anywhere — try it out by typing `dirt` in your terminal.
+**Step 5:** Enjoy! You can now use Dirt anywhere - try it out by typing `dirt` in your terminal.
 
 ---
 
