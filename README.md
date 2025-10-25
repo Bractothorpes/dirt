@@ -1,35 +1,41 @@
 # Dirt
-## A file viewer that allows you to look through, and open files.
+## A simple terminal file viewer that lets you browse, open, and search files easily.
 
-### To install:
-  **Step 1:** head to the latest release [here](https://github.com/Bractothorpes/dirt/releases/tag/v0.1.0) and install the .zip file.
-  **Step 2:** once you have extracted the contents of the zip file run "dirtinstaller.exe" with adim permission to add dirt to your system path.
-  **Step 3:** delete the dirt in your downloads doler (optional).
-  **Step 3:** enjoy! you can now use dirt anywhere, try it out by running "dirt" in the terminal.
+---
 
-### How to use:
-**Navigation:**
-  - Use your arrow keys to navigate the dirt main menu, press [enter] to open a file or folder.
-  - Arrows and [enter] also work in the seperate find menu.
+### Installation
 
-**Keybinds:**
-  - Use [q] to quit the program or exit the find menu.
-  - Use [f] to search though all non-binary files in your folder tree for a peice of text.
-  - Use [r] to refresh incase you added a new file.
-  - Use [g] to go to the top.
-  - Use [G] to go to the bottom.
+**Step 1:** Head to the latest release [here](https://github.com/Bractothorpes/dirt/releases/tag/v0.1.0) and download the `.zip` file.  
+**Step 2:** Extract the contents of the zip file.  
+**Step 3:** Run `dirtinstaller.exe` **with admin permissions** to add Dirt to your system PATH.  
+**Step 4:** *(Optional)* Delete the original Dirt folder from your Downloads folder.  
+**Step 5:** Enjoy! You can now use Dirt anywhere — try it out by typing `dirt` in your terminal.
 
-**Configure:**
-  - On Linux/OSX head to user/local/dirt, on Windows c:\Program Files\dirt
-    Inside there will be a ".dirtconfig" file, you may edit this in 2 ways:
-      1. changing editor=... (this will alter what editor opens files in dirt)
-      2. changing skip_dirs=something,something... (this will change what dirs Dirt will *NOT* look for during word search)
-   
+---
 
-![Dirt](assets/dirt_example.png)
+### How to Use
 
+#### **Navigation**
+- Use the **arrow keys** to move through files and folders.  
+- Press **Enter** to open a file or expand/collapse a folder.  
+- The same controls also work inside the *Find* menu.
 
-      
-**Note:**
-  - default ignored folders: ".git", "node_modules", ".venv", "dist", "build", "target"
-      
+#### **Keybinds**
+- **q** → Quit Dirt or exit the Find menu  
+- **f** → Search through all non-binary files for a piece of text  
+- **r** → Refresh (useful if you’ve added new files)  
+- **g** → Jump to the top  
+- **G** → Jump to the bottom  
+
+---
+
+### Configuration
+
+After installation:
+- **Windows:** `C:\Program Files\dirt`  
+- **Linux / macOS:** `/usr/local/dirt`
+
+Inside that directory is a file named **`.dirtconfig`**.  
+You can edit it in two ways:
+
+1. **Change the default editor:**  
