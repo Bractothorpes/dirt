@@ -12,8 +12,6 @@
 **Step 5:** Enjoy! You can now use Dirt anywhere - try it out by typing `dirt` in your terminal.
 
 ---
-![Dirt](assets/dirt_example.png)
----
 
 ### How to Use
 
