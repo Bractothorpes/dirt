@@ -24,9 +24,11 @@
     Inside there will be a ".dirtconfig" file, you may edit this in 2 ways:
       1. changing editor=... (this will alter what editor opens files in dirt)
       2. changing skip_dirs=something,something... (this will change what dirs Dirt will *NOT* look for during word search)
-      3. 
-**Example:**
+   
+
 ![Dirt](assets/dirt_example.png)
+
+
       
 **Note:**
   - default ignored folders: ".git", "node_modules", ".venv", "dist", "build", "target"
