@@ -38,4 +38,6 @@ After installation:
 Inside that directory is a file named **`.dirtconfig`**.  
 You can edit it in two ways:
 
-1. **Change the default editor:**  
+1. **Change the default editor:**
+  ```ini
+  editor=nvim
