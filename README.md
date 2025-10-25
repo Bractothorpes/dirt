@@ -5,7 +5,7 @@
 
 ### Installation
 
-**Step 1:** Head to the latest release [here](https://github.com/Bractothorpes/dirt/releases/tag/v0.1.0) and download the `.zip` file.  
+**Step 1:** Head to the latest release [here](https://github.com/Bractothorpes/dirt/releases/tag/v0.2.0) and download the `dirt-v0.2.0.zip` file.  
 **Step 2:** Extract the contents of the zip file.  
 **Step 3:** Run `dirtinstaller.exe` **with admin permissions** to add Dirt to your system PATH.  
 **Step 4:** *(Optional)* Delete the original Dirt folder from your Downloads folder.  
