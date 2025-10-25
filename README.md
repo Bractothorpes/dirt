@@ -38,9 +38,11 @@ After installation:
 Inside that directory is a file named **`.dirtconfig`**.  
 You can edit it in two ways:
 
-1. **Change the default editor:**
+1. **Changing the application used to run based on extension, and default:**
   ```ini
-  editor=nvim
+  editor_generic=nvim
+  .txt=notepad
+  .py=code
 ```
 2. **Change the ignored word search folders:**
   ```ini
