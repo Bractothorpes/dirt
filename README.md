@@ -42,7 +42,7 @@ You can edit it in two ways:
   ```ini
   editor=nvim
 ```
-2. **Change the ignored word search folders: **
+2. **Change the ignored word search folders:**
   ```ini
   skip_dirs=.git,node_modules,.cache,build,dist
 ```
