@@ -1,4 +1,4 @@
-# Dirt - <u>Dir</u>ectory *t*ree
+# Dirt - (Dir)ectory (t)ree
 ## A simple terminal file viewer that lets you browse, open, and search files easily.
 
 ---
