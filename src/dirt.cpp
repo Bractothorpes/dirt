@@ -1,0 +1,826 @@
+#include <algorithm>
+#include <filesystem>
+#include <iostream>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+#include <cstdlib>
+#include <fstream>
+#include <cctype>
+
+#if defined(_WIN32)
+#include <windows.h>
+#include <conio.h>
+#include <process.h>
+#else
+#include <termios.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#endif
+
+namespace fs = std::filesystem;
+
+#if defined(_WIN32)
+static const char *HELP_LINE =
+    "[↑/↓] move  [←] collapse  [→] expand  Enter open  [f] find  [r] refresh  [g] top  [G] bottom  [q] quit";
+#else
+static const char *HELP_LINE =
+    u8"↑/↓ move  ← collapse  → expand  Enter open  [f] find  [r] refresh  [g] top  [G] bottom  [q] quit";
+#endif
+
+static constexpr std::uintmax_t SIZE_CAP_BYTES = 2 * 1024 * 1024;
+
+static std::vector<std::string> fallback_editors()
+{
+  std::vector<std::string> v;
+  if (const char *nvim = std::getenv("NVIM"))
+    v.emplace_back(nvim);
+  v.emplace_back("nvim");
+  if (const char *ed = std::getenv("EDITOR"))
+    v.emplace_back(ed);
+  v.emplace_back("vim");
+  v.emplace_back("vi");
+  v.emplace_back("less");
+  return v;
+}
+
+#if defined(_WIN32)
+static void enableAnsiOnWindows()
+{
+  HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+  if (hOut == INVALID_HANDLE_VALUE)
+    return;
+  DWORD mode = 0;
+  if (!GetConsoleMode(hOut, &mode))
+    return;
+  mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+  SetConsoleMode(hOut, mode);
+}
+#endif
+
+static void cursor_to(int row, int col = 1)
+{
+  std::cout << "\033[" << row << ";" << col << "H";
+}
+static void clear_line() { std::cout << "\033[K"; }
+static void hide_cursor(bool hide)
+{
+  std::cout << (hide ? "\033[?25l" : "\033[?25h");
+}
+static void use_alt_screen(bool on)
+{
+  std::cout << (on ? "\033[?1049h" : "\033[?1049l");
+}
+static void clear_screen() { std::cout << "\033[2J"; }
+
+static int terminal_rows()
+{
+#if defined(_WIN32)
+  CONSOLE_SCREEN_BUFFER_INFO info;
+  HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+  if (GetConsoleScreenBufferInfo(hOut, &info))
+    return info.srWindow.Bottom - info.srWindow.Top + 1;
+  return 24;
+#else
+  struct winsize ws{};
+  if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0)
+    return ws.ws_row;
+  return 24;
+#endif
+}
+
+static std::string read_key()
+{
+#if defined(_WIN32)
+  int ch = _getch();
+  if (ch == 0 || ch == 224)
+  {
+    int ch2 = _getch();
+    switch (ch2)
+    {
+    case 72:
+      return "UP";
+    case 80:
+      return "DOWN";
+    case 75:
+      return "LEFT";
+    case 77:
+      return "RIGHT";
+    default:
+      return "";
+    }
+  }
+  if (ch == 13)
+    return "\n";
+  if (ch == 27)
+    return "\x1b";
+  return std::string(1, static_cast<char>(ch));
+#else
+  termios oldt{}, raw{};
+  tcgetattr(STDIN_FILENO, &oldt);
+  raw = oldt;
+  raw.c_lflag &= ~(ICANON | ECHO);
+  tcsetattr(STDIN_FILENO, TCSADRAIN, &raw);
+
+  char c = 0;
+  if (read(STDIN_FILENO, &c, 1) <= 0)
+  {
+    tcsetattr(STDIN_FILENO, TCSADRAIN, &oldt);
+    return "";
+  }
+  if (c == '\x1b')
+  {
+    char seq[2]{};
+    if (read(STDIN_FILENO, &seq[0], 1) == 1 && read(STDIN_FILENO, &seq[1], 1) == 1)
+    {
+      tcsetattr(STDIN_FILENO, TCSADRAIN, &oldt);
+      if (seq[0] == '[' && seq[1] == 'A')
+        return "UP";
+      if (seq[0] == '[' && seq[1] == 'B')
+        return "DOWN";
+      if (seq[0] == '[' && seq[1] == 'D')
+        return "LEFT";
+      if (seq[0] == '[' && seq[1] == 'C')
+        return "RIGHT";
+      return "";
+    }
+    else
+    {
+      tcsetattr(STDIN_FILENO, TCSADRAIN, &oldt);
+      return "\x1b";
+    }
+  }
+  tcsetattr(STDIN_FILENO, TCSADRAIN, &oldt);
+  if (c == '\r')
+    return "\n";
+  return std::string(1, c);
+#endif
+}
+
+static std::string prompt_user(const std::string &label)
+{
+  int rows = terminal_rows();
+  cursor_to(rows, 1);
+  clear_line();
+  std::cout << label << std::flush;
+  std::string s;
+  std::getline(std::cin, s);
+  return s;
+}
+
+struct Node
+{
+  fs::path path;
+  std::string name;
+  Node *parent = nullptr;
+  bool isDir = false;
+  bool expanded = false;
+  std::vector<std::unique_ptr<Node>> children;
+
+  explicit Node(fs::path p, Node *par = nullptr)
+      : path(std::move(p)), parent(par)
+  {
+    isDir = fs::is_directory(path);
+    if (path.filename().empty())
+      name = path.string();
+    else
+      name = path.filename().string();
+  }
+
+  void toggle()
+  {
+    if (!isDir)
+      return;
+    expanded = !expanded;
+    if (expanded && children.empty())
+    {
+      try
+      {
+        std::vector<fs::path> entries;
+        for (auto const &e : fs::directory_iterator(path))
+          entries.push_back(e.path());
+        std::sort(entries.begin(), entries.end(),
+                  [](const fs::path &a, const fs::path &b)
+                  {
+                    bool ad = fs::is_directory(a), bd = fs::is_directory(b);
+                    if (ad != bd)
+                      return ad > bd;
+                    return a.filename().string() < b.filename().string();
+                  });
+        for (auto &e : entries)
+          children.emplace_back(std::make_unique<Node>(e, this));
+      }
+      catch (...)
+      {
+        // ugh..
+      }
+    }
+  }
+};
+
+static void collect_visible(Node *root, int depth, std::vector<std::pair<Node *, int>> &out)
+{
+  out.emplace_back(root, depth);
+  if (root->isDir && root->expanded)
+    for (auto &c : root->children)
+      collect_visible(c.get(), depth + 1, out);
+}
+static std::vector<std::pair<Node *, int>> visible_nodes(Node *root)
+{
+  std::vector<std::pair<Node *, int>> v;
+  v.reserve(1024);
+  collect_visible(root, 0, v);
+  return v;
+}
+
+static std::optional<std::string> read_local_editor()
+{
+  try
+  {
+#if defined(_WIN32)
+    char buf[MAX_PATH];
+    DWORD len = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    if (len == 0 || len == MAX_PATH)
+      return std::nullopt;
+    fs::path exe_dir = fs::path(buf).parent_path();
+#else
+    char buf[4096];
+    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (len == -1)
+      return std::nullopt;
+    buf[len] = '\0';
+    fs::path exe_dir = fs::path(buf).parent_path();
+#endif
+    fs::path cfg = exe_dir / ".dirtconfig";
+    if (!fs::exists(cfg))
+      return std::nullopt;
+
+    std::ifstream f(cfg);
+    std::string line;
+    if (std::getline(f, line))
+    {
+      if (line.rfind("editor=", 0) == 0)
+        return line.substr(7);
+    }
+  }
+  catch (...)
+  {
+    // seriously?
+  }
+  return std::nullopt;
+}
+
+static std::optional<std::string> pick_editor()
+{
+  if (auto local = read_local_editor())
+    return local;
+  for (auto &e : fallback_editors())
+  {
+    if (e.empty())
+      continue;
+#if defined(_WIN32)
+    if (fs::path(e).is_absolute())
+    {
+      if (fs::exists(e))
+        return e;
+    }
+    else
+    {
+      return e;
+    }
+#else
+    if (!fs::path(e).is_absolute())
+      return e;
+    if (fs::exists(e))
+      return e;
+#endif
+  }
+  return std::nullopt;
+}
+
+static void open_in_editor_basic(const std::string &editor, const fs::path &p)
+{
+#if defined(_WIN32)
+  _spawnlp(_P_WAIT, editor.c_str(), editor.c_str(), p.string().c_str(), nullptr);
+#else
+  std::string cmd = editor + std::string(" \"") + p.string() + "\"";
+  std::system(cmd.c_str());
+#endif
+}
+
+static void open_in_editor_at(const fs::path &p, int line)
+{
+  auto ed = pick_editor();
+  if (!ed)
+  {
+    cursor_to(9999, 1);
+    std::cout << "\nNo editor found. Press Enter..." << std::flush;
+    std::string dummy;
+    std::getline(std::cin, dummy);
+    return;
+  }
+
+  std::string editor = *ed;
+  bool is_vim = false;
+  {
+    std::string low = editor;
+    std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c)
+                   { return std::tolower(c); });
+    is_vim = (low.find("vim") != std::string::npos);
+  }
+
+#if defined(_WIN32)
+  if (is_vim && line > 0)
+  {
+    std::string plus = std::string("+") + std::to_string(line);
+    _spawnlp(_P_WAIT, editor.c_str(), editor.c_str(), plus.c_str(), p.string().c_str(), nullptr);
+  }
+  else
+  {
+    _spawnlp(_P_WAIT, editor.c_str(), editor.c_str(), p.string().c_str(), nullptr);
+  }
+#else
+  if (is_vim && line > 0)
+  {
+    std::string cmd = editor + " +" + std::to_string(line) + " \"" + p.string() + "\"";
+    std::system(cmd.c_str());
+  }
+  else
+  {
+    std::string cmd = editor + " \"" + p.string() + "\"";
+    std::system(cmd.c_str());
+  }
+#endif
+}
+
+static void open_in_editor(const fs::path &p)
+{
+  open_in_editor_at(p, -1);
+}
+
+static int move_selection(int idx, int delta, int total)
+{
+  if (total <= 0)
+    return 0;
+  idx += delta;
+  if (idx < 0)
+    idx = 0;
+  if (idx >= total)
+    idx = total - 1;
+  return idx;
+}
+static int goto_top_bottom(int total, bool bottom = false)
+{
+  if (total <= 0)
+    return 0;
+  return bottom ? (total - 1) : 0;
+}
+static void clear_cache(Node *n)
+{
+  for (auto &c : n->children)
+    clear_cache(c.get());
+  n->children.clear();
+}
+
+static bool is_binary_file(const fs::path &p)
+{
+  std::ifstream f(p, std::ios::binary);
+  if (!f)
+    return true;
+  char buf[512];
+  f.read(buf, sizeof(buf));
+  std::streamsize n = f.gcount();
+  for (std::streamsize i = 0; i < n; ++i)
+  {
+    if (buf[i] == '\0')
+      return true;
+  }
+  return false;
+}
+
+static std::vector<std::string> read_skip_dirs()
+{
+  std::vector<std::string> skips = {".git", "node_modules", ".venv", "dist", "build", "target"};
+  try
+  {
+#if defined(_WIN32)
+    char buf[MAX_PATH];
+    DWORD len = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    if (len == 0 || len == MAX_PATH)
+      return skips;
+    fs::path exe_dir = fs::path(buf).parent_path();
+#else
+    char buf[4096];
+    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (len == -1)
+      return skips;
+    buf[len] = '\0';
+    fs::path exe_dir = fs::path(buf).parent_path();
+#endif
+    fs::path cfg = exe_dir / ".dirtconfig";
+    if (!fs::exists(cfg))
+      return skips;
+
+    std::ifstream f(cfg);
+    std::string line;
+    while (std::getline(f, line))
+    {
+      if (line.rfind("skip_dirs=", 0) == 0)
+      {
+        skips.clear();
+        std::string rest = line.substr(10);
+        std::stringstream ss(rest);
+        std::string token;
+        while (std::getline(ss, token, ','))
+        {
+          if (!token.empty())
+            skips.push_back(token);
+        }
+      }
+    }
+  }
+  catch (...)
+  {
+    // better luck next time i guess
+  }
+  return skips;
+}
+
+static bool should_skip_dir(const fs::path &p)
+{
+  static std::vector<std::string> skips = read_skip_dirs();
+  std::string name = p.filename().string();
+  for (const auto &s : skips)
+  {
+    if (name == s)
+      return true;
+  }
+  return false;
+}
+
+static std::string to_lower_copy(std::string s)
+{
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c)
+                 { return std::tolower(c); });
+  return s;
+}
+
+struct Match
+{
+  fs::path file;
+  int line;
+  std::string preview;
+};
+
+static std::vector<Match> find_in_files(const fs::path &base, const std::string &query)
+{
+  std::vector<Match> results;
+  std::string q = to_lower_copy(query);
+
+  std::error_code ec;
+  for (fs::recursive_directory_iterator it(base, fs::directory_options::skip_permission_denied, ec), end; it != end;)
+  {
+    const fs::directory_entry &ent = *it;
+    const fs::path p = ent.path();
+
+    if (ent.is_directory(ec))
+    {
+      if (should_skip_dir(p))
+      {
+        it.disable_recursion_pending();
+      }
+      ++it;
+      continue;
+    }
+
+    if (!ent.is_regular_file(ec))
+    {
+      ++it;
+      continue;
+    }
+
+    std::uintmax_t sz = ent.file_size(ec);
+    if (!ec && sz > SIZE_CAP_BYTES)
+    {
+      ++it;
+      continue;
+    }
+
+    if (is_binary_file(p))
+    {
+      ++it;
+      continue;
+    }
+
+    std::ifstream f(p);
+    if (!f)
+    {
+      ++it;
+      continue;
+    }
+
+    std::string line;
+    int lineno = 0;
+    bool hit = false;
+    while (std::getline(f, line))
+    {
+      ++lineno;
+      std::string low = to_lower_copy(line);
+      if (low.find(q) != std::string::npos)
+      {
+        results.push_back({p, lineno, line});
+        hit = true;
+        break;
+      }
+    }
+    ++it;
+  }
+  return results;
+}
+
+static int clamp(int v, int lo, int hi) { return (v < lo) ? lo : (v > hi ? hi : v); }
+
+static std::optional<Match> search_dialog_and_select(const fs::path &base)
+{
+  std::string query = prompt_user("\033[36mfind:\033[0m ");
+  if (query.empty())
+    return std::nullopt;
+
+  clear_screen();
+  cursor_to(1, 1);
+  std::cout << "Searching for \"" << query << "\"...\n"
+            << std::flush;
+
+  auto matches = find_in_files(base, query);
+
+  if (matches.empty())
+  {
+    int rows = terminal_rows();
+    cursor_to(rows, 1);
+    clear_line();
+    std::cout << "No matches. Press Enter..." << std::flush;
+    std::string dummy;
+    std::getline(std::cin, dummy);
+    return std::nullopt;
+  }
+
+  int sel = 0;
+  int scroll = 0;
+  while (true)
+  {
+    int rows = terminal_rows();
+    int header = 2;
+    int view = std::max(1, rows - header);
+
+    cursor_to(1, 1);
+    clear_screen();
+    std::cout << "\033[36mMatches for \"" << query << "\" (" << matches.size()
+              << "). Enter=open  q/ESC=back  ↑/↓ move\033[0m\n\n";
+
+    int total = static_cast<int>(matches.size());
+    sel = clamp(sel, 0, total - 1);
+    if (sel < scroll)
+      scroll = sel;
+    if (sel >= scroll + view)
+      scroll = sel - (view - 1);
+    scroll = clamp(scroll, 0, std::max(0, total - view));
+
+    for (int i = scroll; i < std::min(scroll + view, total); ++i)
+    {
+      const auto &m = matches[i];
+      std::string pathstr = m.file.string();
+      std::string preview = m.preview;
+      for (char &c : preview)
+        if (static_cast<unsigned char>(c) < 0x20 && c != '\t')
+          c = ' ';
+      if ((int)preview.size() > 120)
+        preview.erase(120);
+
+      if (i == sel)
+        std::cout << "\033[7m";
+      std::cout << pathstr << ":" << m.line << "  -  " << preview << "\033[0m\n";
+    }
+    std::cout.flush();
+
+    std::string k = read_key();
+    if (k == "q" || k == "\x1b")
+      return std::nullopt;
+    if (k == "UP" || k == "k")
+    {
+      sel = clamp(sel - 1, 0, (int)matches.size() - 1);
+    }
+    else if (k == "DOWN" || k == "j")
+    {
+      sel = clamp(sel + 1, 0, (int)matches.size() - 1);
+    }
+    else if (k == "\n")
+    {
+      return matches[sel];
+    }
+  }
+}
+
+static std::vector<std::string> prev_frame;
+
+static std::tuple<std::vector<std::pair<Node *, int>>, int, int>
+draw(Node *root, int sel_index, int scroll)
+{
+  auto vis = visible_nodes(root);
+  int total = static_cast<int>(vis.size());
+
+  int rows = terminal_rows();
+  int header_rows = 3;
+  int win_height = std::max(1, rows - header_rows);
+
+  int max_scroll = std::max(0, total - win_height);
+  if (scroll < 0)
+    scroll = 0;
+  if (scroll > max_scroll)
+    scroll = max_scroll;
+
+  std::vector<std::string> frame;
+  frame.reserve(static_cast<size_t>(header_rows + win_height));
+
+  frame.emplace_back(std::string("\033[36m") + HELP_LINE + "\033[0m");
+  frame.emplace_back(std::string("\033[34mcwd: ") + fs::current_path().string() +
+                     " | items: " + std::to_string(total) + "\033[0m");
+  frame.emplace_back("");
+
+  for (int i = scroll; i < std::min(scroll + win_height, total); ++i)
+  {
+    auto [node, depth] = vis[i];
+    std::string prefix(static_cast<size_t>(depth) * 2, ' ');
+    bool isDir = node->isDir;
+    bool exp = node->expanded;
+    std::string marker = isDir ? (exp ? "[+]" : "[ ]") : "   ";
+    std::string color = isDir ? "\033[36m" : "\033[37m";
+    std::string line = prefix + marker + " " + node->name;
+    if (i == sel_index)
+      frame.emplace_back("\033[7m" + line + "\033[0m");
+    else
+      frame.emplace_back(color + line + "\033[0m");
+  }
+
+  while ((int)frame.size() < header_rows + win_height)
+    frame.emplace_back("");
+
+  for (int r = 0; r < (int)frame.size(); ++r)
+  {
+    if (r < (int)prev_frame.size() && prev_frame[r] == frame[r])
+      continue;
+    cursor_to(r + 1, 1);
+    std::cout << frame[r];
+    clear_line();
+  }
+  std::cout.flush();
+  prev_frame.swap(frame);
+  return {std::move(vis), scroll, win_height};
+}
+
+struct TermRestore
+{
+  TermRestore()
+  {
+    use_alt_screen(true);
+    hide_cursor(true);
+  }
+  ~TermRestore()
+  {
+    hide_cursor(false);
+    use_alt_screen(false);
+    std::cout.flush();
+  }
+};
+
+int main()
+{
+#if defined(_WIN32)
+  enableAnsiOnWindows();
+  SetConsoleOutputCP(CP_UTF8);
+  SetConsoleCP(CP_UTF8);
+  std::ios::sync_with_stdio(false);
+  std::cout.sync_with_stdio(false);
+#endif
+  TermRestore _guard;
+
+  Node root(fs::current_path());
+  root.expanded = true;
+  root.toggle();
+
+  int sel_index = 0;
+  int scroll = 0;
+
+  try
+  {
+    while (true)
+    {
+      auto [vis, cur_scroll, win_height] = draw(&root, sel_index, scroll);
+      scroll = cur_scroll;
+      int total = static_cast<int>(vis.size());
+
+      std::string ch = read_key();
+      if (ch == "q" || ch == "\x1b")
+        break;
+      else if (ch == "UP" || ch == "k")
+        sel_index = move_selection(sel_index, -1, total);
+      else if (ch == "DOWN" || ch == "j")
+        sel_index = move_selection(sel_index, +1, total);
+      else if (ch == "RIGHT" || ch == "l")
+      {
+        if (total > 0)
+        {
+          auto [n, _] = vis[sel_index];
+          if (n->isDir && !n->expanded)
+            n->toggle();
+          else if (n->isDir && !n->children.empty())
+            sel_index = std::min(sel_index + 1, total - 1);
+        }
+      }
+      else if (ch == "LEFT" || ch == "h")
+      {
+        if (total > 0)
+        {
+          auto [n, _] = vis[sel_index];
+          if (n->isDir && n->expanded)
+            n->toggle();
+          else if (n->parent)
+            for (int i = 0; i < total; ++i)
+              if (vis[i].first == n->parent)
+              {
+                sel_index = i;
+                break;
+              }
+        }
+      }
+      else if (ch == "\n")
+      {
+        if (total > 0)
+        {
+          auto [n, _] = vis[sel_index];
+          if (n->isDir)
+            n->toggle();
+          else
+          {
+            open_in_editor(n->path);
+            prev_frame.clear();
+          }
+        }
+      }
+      else if (ch == "f")
+      {
+        auto maybe = search_dialog_and_select(fs::current_path());
+        if (maybe)
+        {
+          open_in_editor_at(maybe->file, maybe->line);
+          prev_frame.clear();
+        }
+        else
+        {
+          prev_frame.clear();
+        }
+      }
+      else if (ch == "r")
+      {
+        clear_cache(&root);
+        root.expanded = true;
+        root.toggle();
+        prev_frame.clear();
+      }
+      else if (ch == "g")
+        sel_index = goto_top_bottom(total, false);
+      else if (ch == "G")
+        sel_index = goto_top_bottom(total, true);
+
+      if (sel_index < scroll)
+        scroll = sel_index;
+      else if (sel_index >= scroll + win_height)
+        scroll = sel_index - (win_height - 1);
+
+      total = static_cast<int>(visible_nodes(&root).size());
+      if (total <= 0)
+      {
+        sel_index = 0;
+        scroll = 0;
+      }
+      else
+      {
+        if (sel_index >= total)
+          sel_index = total - 1;
+        int rows = terminal_rows();
+        int header_rows = 3;
+        int win_height2 = std::max(1, rows - header_rows);
+        int max_scroll = std::max(0, total - win_height2);
+        if (scroll < 0)
+          scroll = 0;
+        if (scroll > max_scroll)
+          scroll = max_scroll;
+      }
+    }
+  }
+  catch (...)
+  {
+    // oh well....
+  }
+  return 0;
+}
