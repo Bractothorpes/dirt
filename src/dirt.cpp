@@ -14,20 +14,25 @@
 #include <windows.h>
 #include <conio.h>
 #include <process.h>
+#include <shellapi.h>
 #else
 #include <termios.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <limits.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #endif
 
 namespace fs = std::filesystem;
 
 #if defined(_WIN32)
 static const char *HELP_LINE =
-    "[↑/↓] move  [←] collapse  [→] expand  Enter open  [f] find  [r] refresh  [g] top  [G] bottom  [q] quit";
+    "[\x18/\x19] move  [\x1b[D] collapse  [\x1b[C] expand  Enter open  [f] find  [r] refresh  [g] top  [G] bottom  [q] quit";
 #else
 static const char *HELP_LINE =
-    u8"↑/↓ move  ← collapse  → expand  Enter open  [f] find  [r] refresh  [g] top  [G] bottom  [q] quit";
+    "[↑/↓] move  [←] collapse  [→] expand  Enter open  [f] find  [r] refresh  [g] top  [G] bottom  [q] quit";
 #endif
 
 static constexpr std::uintmax_t SIZE_CAP_BYTES = 2 * 1024 * 1024;
@@ -63,19 +68,10 @@ static void enableAnsiOnWindows()
 }
 #endif
 
-static void cursor_to(int row, int col = 1)
-{
-  std::cout << "\033[" << row << ";" << col << "H";
-}
+static void cursor_to(int row, int col = 1) { std::cout << "\033[" << row << ";" << col << "H"; }
 static void clear_line() { std::cout << "\033[K"; }
-static void hide_cursor(bool hide)
-{
-  std::cout << (hide ? "\033[?25l" : "\033[?25h");
-}
-static void use_alt_screen(bool on)
-{
-  std::cout << (on ? "\033[?1049h" : "\033[?1049l");
-}
+static void hide_cursor(bool hide) { std::cout << (hide ? "\033[?25l" : "\033[?25h"); }
+static void use_alt_screen(bool on) { std::cout << (on ? "\033[?1049h" : "\033[?1049l"); }
 static void clear_screen() { std::cout << "\033[2J"; }
 
 static int terminal_rows()
@@ -187,7 +183,6 @@ static std::string prompt_user(const std::string &label)
 #if !defined(_WIN32)
   tcsetattr(STDIN_FILENO, TCSADRAIN, &oldt);
 #endif
-
   return s;
 }
 
@@ -200,8 +195,7 @@ struct Node
   bool expanded = false;
   std::vector<std::unique_ptr<Node>> children;
 
-  explicit Node(fs::path p, Node *par = nullptr)
-      : path(std::move(p)), parent(par)
+  explicit Node(fs::path p, Node *par = nullptr) : path(std::move(p)), parent(par)
   {
     isDir = fs::is_directory(path);
     name = path.filename().empty() ? path.string() : path.filename().string();
@@ -251,25 +245,44 @@ static std::vector<std::pair<Node *, int>> visible_nodes(Node *root)
   return v;
 }
 
+static std::optional<std::string> exe_dir_path()
+{
+#if defined(_WIN32)
+  char buf[MAX_PATH];
+  DWORD len = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+  if (len == 0 || len == MAX_PATH)
+    return std::nullopt;
+  return fs::path(buf).parent_path().string();
+#else
+  // Linux: /proc/self/exe, macOS: _NSGetExecutablePath
+  fs::path p;
+#if defined(__APPLE__)
+  uint32_t size = 0;
+  _NSGetExecutablePath(nullptr, &size);
+  std::string tmp(size, '\0');
+  if (_NSGetExecutablePath(tmp.data(), &size) != 0)
+    return std::nullopt;
+  p = fs::path(tmp).lexically_normal();
+#else
+  char buf[PATH_MAX];
+  ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+  if (n < 0)
+    return std::nullopt;
+  buf[n] = '\0';
+  p = fs::path(buf);
+#endif
+  return p.parent_path().string();
+#endif
+}
+
 static std::optional<std::string> read_editor_for_ext(const std::string &ext)
 {
   try
   {
-#if defined(_WIN32)
-    char buf[MAX_PATH];
-    DWORD len = GetModuleFileNameA(nullptr, buf, MAX_PATH);
-    if (len == 0 || len == MAX_PATH)
+    auto dir = exe_dir_path();
+    if (!dir)
       return std::nullopt;
-    fs::path exe_dir = fs::path(buf).parent_path();
-#else
-    char buf[4096];
-    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (len == -1)
-      return std::nullopt;
-    buf[len] = '\0';
-    fs::path exe_dir = fs::path(buf).parent_path();
-#endif
-    fs::path cfg = exe_dir / ".dirtconfig";
+    fs::path cfg = fs::path(*dir) / ".dirtconfig";
     if (!fs::exists(cfg))
       return std::nullopt;
 
@@ -281,14 +294,19 @@ static std::optional<std::string> read_editor_for_ext(const std::string &ext)
     while (std::getline(f, line))
     {
       line.erase(0, line.find_first_not_of(" \t\r\n"));
-      line.erase(line.find_last_not_of(" \t\r\n") + 1);
+      if (!line.empty())
+        line.erase(line.find_last_not_of(" \t\r\n") + 1);
       if (line.empty() || line[0] == '#')
         continue;
 
       if (line.rfind("editor_generic=", 0) == 0)
+      {
         generic = line.substr(15);
+      }
       else if (!ext_lower.empty() && line.rfind(ext_lower + "=", 0) == 0)
+      {
         return line.substr(ext_lower.size() + 1);
+      }
     }
 
     if (!generic.empty())
@@ -382,10 +400,7 @@ static void open_in_editor_at(const fs::path &p, int line)
 #endif
 }
 
-static void open_in_editor(const fs::path &p)
-{
-  open_in_editor_at(p, -1);
-}
+static void open_in_editor(const fs::path &p) { open_in_editor_at(p, -1); }
 
 static std::string to_lower_copy(std::string s)
 {
@@ -612,12 +627,14 @@ int main()
           if (n->isDir && n->expanded)
             n->toggle();
           else if (n->parent)
+          {
             for (int i = 0; i < total; ++i)
               if (vis[i].first == n->parent)
               {
                 sel_index = i;
                 break;
               }
+          }
         }
       }
       else if (ch == "\n")
@@ -634,6 +651,27 @@ int main()
               open_in_editor(n->path);
             }
             prev_frame.clear();
+          }
+        }
+      }
+      else if (ch == "\t")
+      {
+        if (total > 0)
+        {
+          auto [n, _] = vis[sel_index];
+          if (n->isDir)
+          {
+            std::error_code ec;
+            fs::current_path(n->path, ec);
+            if (!ec)
+            {
+              root = Node(fs::current_path());
+              root.expanded = true;
+              root.toggle();
+              sel_index = 0;
+              scroll = 0;
+              prev_frame.clear();
+            }
           }
         }
       }
@@ -671,5 +709,17 @@ int main()
   {
   }
 
+  if (const char *out = std::getenv("DIRT_OUT"))
+  {
+    try
+    {
+      std::ofstream f(out);
+      if (f)
+        f << fs::current_path().string();
+    }
+    catch (...)
+    {
+    }
+  }
   return 0;
 }
